@@ -18,9 +18,11 @@ use crate::storage::{StorageFactory, TorrentStorage};
 use super::opened_file::OpenedFile;
 
 fn overlap_spill_root(shared: &ManagedTorrentShared) -> PathBuf {
-    std::env::temp_dir()
-        .join("rqbit-overlap")
-        .join(format!("{}-{}", shared.info_hash.as_string(), shared.id))
+    std::env::temp_dir().join("rqbit-overlap").join(format!(
+        "{}-{}",
+        shared.info_hash.as_string(),
+        shared.id
+    ))
 }
 
 #[derive(Default, Clone, Copy)]
