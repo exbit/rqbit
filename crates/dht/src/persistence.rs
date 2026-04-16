@@ -146,6 +146,7 @@ impl PersistentDht {
                     }
                 },
             };
+            let has_persisted_listen_addr = de.is_some() && config.port.is_none();
             let (mut listen_addr, routing_table, peer_store) = de
                 .map(|de| (Some(de.addr), Some(de.table), de.peer_store))
                 .unwrap_or((None, None, None));
@@ -163,6 +164,7 @@ impl PersistentDht {
                 peer_id,
                 routing_table,
                 listen_addr,
+                fallback_to_random_port_on_bind_error: has_persisted_listen_addr,
                 peer_store,
                 cancellation_token,
                 bind_device,

@@ -1280,6 +1280,7 @@ pub struct DhtConfig<'a> {
     pub routing_table: Option<RoutingTable>,
     pub routing_table_v6: Option<RoutingTable>,
     pub listen_addr: Option<SocketAddr>,
+    pub fallback_to_random_port_on_bind_error: bool,
     pub peer_store: Option<PeerStore>,
     pub cancellation_token: Option<CancellationToken>,
     pub bind_device: Option<&'a BindDevice>,
@@ -1299,15 +1300,32 @@ impl DhtState {
             let addr = config
                 .listen_addr
                 .unwrap_or((Ipv6Addr::UNSPECIFIED, 0).into());
-            let socket = UdpSocket::bind_udp(
-                addr,
-                librqbit_dualstack_sockets::BindOpts {
-                    request_dualstack: true,
-                    reuseport: false,
-                    device: config.bind_device,
-                },
-            )
-            .map_err(|e| Error::Bind(Box::new(e)))?;
+            let bind_socket = |addr| {
+                UdpSocket::bind_udp(
+                    addr,
+                    librqbit_dualstack_sockets::BindOpts {
+                        request_dualstack: true,
+                        reuseport: false,
+                        device: config.bind_device,
+                    },
+                )
+                .map_err(|e| Error::Bind(Box::new(e)))
+            };
+            let socket = match bind_socket(addr) {
+                Ok(socket) => socket,
+                Err(Error::Bind(error))
+                    if config.fallback_to_random_port_on_bind_error && addr.port() != 0 =>
+                {
+                    let fallback_addr = SocketAddr::new(addr.ip(), 0);
+                    warn!(
+                        original_addr = ?addr,
+                        fallback_addr = ?fallback_addr,
+                        "failed to bind restored DHT listen address, retrying with a new port: {error:#}"
+                    );
+                    bind_socket(fallback_addr)?
+                }
+                Err(error) => return Err(error),
+            };
 
             let listen_addr = socket.bind_addr();
             info!("DHT listening on {:?}", listen_addr);
