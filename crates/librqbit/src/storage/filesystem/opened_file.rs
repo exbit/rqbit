@@ -10,6 +10,9 @@ use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use crate::Error;
 
+#[cfg(windows)]
+const WINDOWS_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
 pub trait OurFileExt {
     fn pwrite_all_vectored(&self, offset: u64, bufs: [IoSlice<'_>; 2]) -> anyhow::Result<usize>;
     fn pread_exact(&self, offset: u64, buf: &mut [u8]) -> anyhow::Result<()>;
@@ -181,17 +184,31 @@ impl OpenedFile {
         let parent = g.path.parent().context("bug: no parent")?;
         std::fs::create_dir_all(parent)
             .with_context(|| format!("error creating parent directory for {:?}", g.path))?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
+        let file = writable_open_options()
             .open(&g.path)
             .with_context(|| format!("error opening {:?} in read/write mode", g.path))?;
         g.fd = Some(file);
         #[cfg(windows)]
         {
             g.tried_marking_sparse = false;
+        }
+        Ok(())
+    }
+
+    pub fn reopen_read_only(&self) -> anyhow::Result<()> {
+        let mut g = self.file.write();
+        if g.path.as_os_str().is_empty() {
+            return Ok(());
+        }
+
+        g.fd = None;
+        let file = read_only_open_options()
+            .open(&g.path)
+            .with_context(|| format!("error reopening {:?} in read-only mode", g.path))?;
+        g.fd = Some(file);
+        #[cfg(windows)]
+        {
+            g.tried_marking_sparse = true;
         }
         Ok(())
     }
@@ -226,6 +243,29 @@ impl OpenedFile {
         }
         let g = parking_lot::RwLockWriteGuard::downgrade(g);
         Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())
+    }
+}
+
+fn writable_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    apply_share_mode(&mut options);
+    options
+}
+
+fn read_only_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    apply_share_mode(&mut options);
+    options
+}
+
+fn apply_share_mode(options: &mut OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        options.share_mode(WINDOWS_SHARE_READ_WRITE_DELETE);
     }
 }
 

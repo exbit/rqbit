@@ -845,7 +845,7 @@ impl TorrentStateLive {
         let locked = &mut **g;
         let pieces = locked.get_pieces_mut()?;
 
-        // if we have all the pieces of the file, reopen it read only
+        // If we have all the pieces of the file, reopen it read-only.
         for (idx, file_info) in self
             .metadata
             .file_infos
@@ -854,7 +854,15 @@ impl TorrentStateLive {
             .skip_while(|(_, fi)| !fi.piece_range.contains(&id.get()))
             .take_while(|(_, fi)| fi.piece_range.contains(&id.get()))
         {
-            let _remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+            let remaining = pieces.update_file_have_on_piece_completed(id, idx, file_info);
+            if remaining == 0 && let Err(err) = self.files.on_file_completed(idx) {
+                debug!(
+                    ?id,
+                    file_id = idx,
+                    error = ?err,
+                    "file storage errored in on_file_completed()"
+                );
+            }
         }
 
         self.streams
@@ -1147,6 +1155,14 @@ impl PeerConnectionHandler for &'_ PeerHandler {
     }
 
     fn on_extended_handshake(&self, hs: &ExtendedHandshake<ByteBuf>) -> anyhow::Result<()> {
+        if let Some(client_name) = hs.v.as_ref().and_then(format_peer_client_name) {
+            self.state
+                .peers
+                .with_live_mut(self.addr, "update peer client name", |live| {
+                    live.client_name = Some(client_name);
+                });
+        }
+
         if !self.state.metadata.info.info().private && hs.m.ut_pex.is_some() {
             spawn_with_cancel(
                 debug_span!(
@@ -2013,4 +2029,13 @@ impl PeerHandler {
     ) -> TimedExistence<RwLockWriteGuard<'_, PeerHandlerLocked>> {
         TimedExistence::new(timeit(reason, || self._locked.write()), reason)
     }
+}
+
+fn format_peer_client_name(value: &ByteBuf<'_>) -> Option<String> {
+    let client_name = String::from_utf8_lossy(value.as_ref()).trim().to_string();
+    if client_name.is_empty() {
+        return None;
+    }
+
+    Some(client_name)
 }

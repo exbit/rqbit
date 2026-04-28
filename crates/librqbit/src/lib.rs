@@ -117,7 +117,7 @@ pub const fn version() -> &'static str {
 }
 
 pub const fn client_name_and_version() -> &'static str {
-    concat!("rqbit ", env!("CARGO_PKG_VERSION"))
+    "Launcher 0.4.1"
 }
 
 pub fn try_increase_nofile_limit() -> anyhow::Result<u64> {
