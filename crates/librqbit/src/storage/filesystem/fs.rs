@@ -74,7 +74,7 @@ impl FilesystemStorage {
 impl TorrentStorage for FilesystemStorage {
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
         let file = self.opened_files.get(file_id).context("no such file")?;
-        file.ensure_opened()?;
+        file.ensure_opened_read_only()?;
         file.lock_read()?.pread_exact(offset, buf)
     }
 

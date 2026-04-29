@@ -166,6 +166,32 @@ impl OpenedFile {
         })
     }
 
+    pub fn ensure_opened_read_only(&self) -> anyhow::Result<()> {
+        {
+            let g = self.file.read();
+            if g.fd.is_some() {
+                return Ok(());
+            }
+        }
+
+        let mut g = self.file.write();
+        if g.fd.is_some() {
+            return Ok(());
+        }
+        if g.path.as_os_str().is_empty() {
+            anyhow::bail!(Error::FsFileIsNone);
+        }
+        let file = read_only_open_options()
+            .open(&g.path)
+            .with_context(|| format!("error opening {:?} in read-only mode", g.path))?;
+        g.fd = Some(file);
+        #[cfg(windows)]
+        {
+            g.tried_marking_sparse = true;
+        }
+        Ok(())
+    }
+
     pub fn ensure_opened(&self) -> anyhow::Result<()> {
         {
             let g = self.file.read();
@@ -286,7 +312,7 @@ mod tests {
     use peer_binary_protocol::DoubleBufHelper;
     use tempfile::TempDir;
 
-    use crate::storage::filesystem::opened_file::OurFileExt;
+    use crate::storage::filesystem::opened_file::{OpenedFile, OurFileExt};
 
     #[test]
     fn test_pwrite_all_vectored() {
@@ -312,5 +338,16 @@ mod tests {
                 assert_eq!(&tmp_buf[..bufsize], buf);
             }
         }
+    }
+
+    #[test]
+    fn lazy_read_does_not_create_missing_file() {
+        let td = TempDir::with_prefix("lazy_read_does_not_create_missing_file").unwrap();
+        let path = td.path().join("missing").join("file.bin");
+        let file = OpenedFile::new_lazy(path.clone());
+
+        assert!(file.ensure_opened_read_only().is_err());
+        assert!(!path.exists());
+        assert!(!path.parent().unwrap().exists());
     }
 }
