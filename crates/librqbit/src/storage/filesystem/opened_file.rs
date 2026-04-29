@@ -195,6 +195,15 @@ impl OpenedFile {
         Ok(())
     }
 
+    pub fn close(&self) {
+        let mut g = self.file.write();
+        g.fd = None;
+        #[cfg(windows)]
+        {
+            g.tried_marking_sparse = false;
+        }
+    }
+
     pub fn reopen_read_only(&self) -> anyhow::Result<()> {
         let mut g = self.file.write();
         if g.path.as_os_str().is_empty() {

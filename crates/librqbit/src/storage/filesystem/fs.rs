@@ -73,11 +73,9 @@ impl FilesystemStorage {
 
 impl TorrentStorage for FilesystemStorage {
     fn pread_exact(&self, file_id: usize, offset: u64, buf: &mut [u8]) -> anyhow::Result<()> {
-        self.opened_files
-            .get(file_id)
-            .context("no such file")?
-            .lock_read()?
-            .pread_exact(offset, buf)
+        let file = self.opened_files.get(file_id).context("no such file")?;
+        file.ensure_opened()?;
+        file.lock_read()?.pread_exact(offset, buf)
     }
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
@@ -125,6 +123,14 @@ impl TorrentStorage for FilesystemStorage {
             output_folder: self.output_folder.clone(),
             overlap_spill_root: self.overlap_spill_root.clone(),
         }))
+    }
+
+    fn release_files(&self) -> anyhow::Result<()> {
+        for file in &self.opened_files {
+            file.close();
+        }
+
+        Ok(())
     }
 
     fn on_file_completed(&self, file_id: usize) -> anyhow::Result<()> {
