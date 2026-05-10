@@ -302,6 +302,9 @@ fn apply_share_mode(options: &mut OpenOptions) {
 
         options.share_mode(WINDOWS_SHARE_READ_WRITE_DELETE);
     }
+
+    #[cfg(not(windows))]
+    let _ = options;
 }
 
 #[cfg(test)]
