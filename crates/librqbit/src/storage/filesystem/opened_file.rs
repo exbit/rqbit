@@ -107,6 +107,12 @@ struct OpenedFileLocked {
     #[allow(unused)]
     path: PathBuf,
     fd: Option<File>,
+    // Whether the currently opened `fd` was opened in read-only mode.
+    // A read-only fd cannot be written to: doing so fails with EBADF on unix
+    // and ERROR_ACCESS_DENIED (os error 5) on Windows. We must reopen it for
+    // writing before any write (e.g. a piece that spans into an already
+    // completed, reopened-read-only neighbouring file).
+    read_only: bool,
     #[cfg(windows)]
     tried_marking_sparse: bool,
 }
@@ -136,6 +142,7 @@ impl OpenedFile {
             file: RwLock::new(OpenedFileLocked {
                 path,
                 fd: Some(f),
+                read_only: false,
                 #[cfg(windows)]
                 tried_marking_sparse: false,
             }),
@@ -153,6 +160,7 @@ impl OpenedFile {
             file: RwLock::new(OpenedFileLocked {
                 path,
                 fd: None,
+                read_only: false,
                 #[cfg(windows)]
                 tried_marking_sparse: false,
             }),
@@ -185,6 +193,7 @@ impl OpenedFile {
             .open(&g.path)
             .with_context(|| format!("error opening {:?} in read-only mode", g.path))?;
         g.fd = Some(file);
+        g.read_only = true;
         #[cfg(windows)]
         {
             g.tried_marking_sparse = true;
@@ -195,13 +204,14 @@ impl OpenedFile {
     pub fn ensure_opened(&self) -> anyhow::Result<()> {
         {
             let g = self.file.read();
-            if g.fd.is_some() {
+            // A read-only fd is not good enough here: we need to be able to write.
+            if g.fd.is_some() && !g.read_only {
                 return Ok(());
             }
         }
 
         let mut g = self.file.write();
-        if g.fd.is_some() {
+        if g.fd.is_some() && !g.read_only {
             return Ok(());
         }
         if g.path.as_os_str().is_empty() {
@@ -210,10 +220,13 @@ impl OpenedFile {
         let parent = g.path.parent().context("bug: no parent")?;
         std::fs::create_dir_all(parent)
             .with_context(|| format!("error creating parent directory for {:?}", g.path))?;
+        // Drop a stale read-only handle (if any) before reopening for writing.
+        g.fd = None;
         let file = writable_open_options()
             .open(&g.path)
             .with_context(|| format!("error opening {:?} in read/write mode", g.path))?;
         g.fd = Some(file);
+        g.read_only = false;
         #[cfg(windows)]
         {
             g.tried_marking_sparse = false;
@@ -241,6 +254,7 @@ impl OpenedFile {
             .open(&g.path)
             .with_context(|| format!("error reopening {:?} in read-only mode", g.path))?;
         g.fd = Some(file);
+        g.read_only = true;
         #[cfg(windows)]
         {
             g.tried_marking_sparse = true;
