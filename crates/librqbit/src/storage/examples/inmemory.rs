@@ -5,6 +5,7 @@ use librqbit_core::lengths::{Lengths, ValidPieceIndex};
 use parking_lot::RwLock;
 
 use crate::type_aliases::FileInfos;
+use crate::{ManagedTorrentShared, TorrentMetadata};
 
 use crate::storage::{StorageFactory, StorageFactoryExt, TorrentStorage};
 
@@ -27,9 +28,10 @@ impl StorageFactory for InMemoryExampleStorageFactory {
 
     fn create(
         &self,
-        info: &crate::torrent_state::ManagedTorrentShared,
+        _shared: &ManagedTorrentShared,
+        metadata: &TorrentMetadata,
     ) -> anyhow::Result<InMemoryExampleStorage> {
-        InMemoryExampleStorage::new(info.lengths, info.file_infos.clone())
+        InMemoryExampleStorage::new(*metadata.lengths(), metadata.file_infos.clone())
     }
 
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
@@ -113,9 +115,9 @@ impl TorrentStorage for InMemoryExampleStorage {
 
     fn init(
         &mut self,
-        _meta: &crate::ManagedTorrentShared,
-        _: &crate::TorrentMetadata,
-        _: Option<&[usize]>,
+        _shared: &ManagedTorrentShared,
+        _metadata: &TorrentMetadata,
+        _only_files: Option<&[usize]>,
     ) -> anyhow::Result<()> {
         Ok(())
     }

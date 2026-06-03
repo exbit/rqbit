@@ -268,6 +268,7 @@ impl OpenedFile {
             .ok_or(Error::FsFileIsNone)
     }
 
+    #[allow(dead_code)]
     pub fn lock_write(&self) -> crate::Result<impl DerefMut<Target = File>> {
         RwLockWriteGuard::try_map(self.file.write(), |f| f.as_mut())
             .ok()
@@ -288,7 +289,7 @@ impl OpenedFile {
         if !g.tried_marking_sparse {
             g.tried_marking_sparse = true;
             let f = g.fd.as_ref().ok_or(Error::FsFileIsNone)?;
-            tracing::debug!(path=?g.path, marked=super::sparse::mark_file_sparse(&f), "marking sparse");
+            tracing::debug!(path=?g.path, marked=super::sparse::mark_file_sparse(f), "marking sparse");
         }
         let g = parking_lot::RwLockWriteGuard::downgrade(g);
         Ok(RwLockReadGuard::try_map(g, |f| f.fd.as_ref()).ok().unwrap())

@@ -5,7 +5,6 @@ use std::{
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::Arc,
-    thread,
     time::Duration,
 };
 
@@ -14,15 +13,13 @@ use clap::{CommandFactory, Parser, ValueEnum};
 use clap_complete::Shell;
 use librqbit::{
     AddTorrent, AddTorrentOptions, AddTorrentResponse, Api, ConnectionOptions,
-    CreateTorrentOptions, ListOnlyResponse, ListenerMode, ListenerOptions, PeerConnectionOptions,
-    Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    CreateTorrentOptions, DhtSessionConfig, ListOnlyResponse, ListenerMode, ListenerOptions,
+    PeerConnectionOptions, Session, SessionOptions, SessionPersistenceConfig, TorrentStatsState,
+    dht::DhtPersistenceConfig,
     http_api::{HttpApi, HttpApiOptions},
     librqbit_spawn,
     limits::LimitsConfig,
-    storage::{
-        StorageFactory, StorageFactoryExt,
-        filesystem::{FilesystemStorageFactory, MmapFilesystemStorageFactory},
-    },
+    storage::{StorageFactory, StorageFactoryExt, filesystem::FilesystemStorageFactory},
     tracing_subscriber_config_utils::{InitLoggingOptions, InitLoggingResult, init_logging},
 };
 use librqbit_dualstack_sockets::TcpListener;
@@ -83,6 +80,8 @@ struct Opts {
         env = "RQBIT_LOG_FILE_RUST_LOG"
     )]
     log_file_rust_log: String,
+    #[arg(long = "log-file-json", env = "RQBIT_LOG_FILE_JSON")]
+    log_file_json: bool,
 
     /// The interval to poll trackers, e.g. 30s.
     /// Trackers send the refresh interval when we connect to them. Often this is
@@ -217,11 +216,6 @@ struct Opts {
         env = "RQBIT_RUNTIME_MAX_BLOCKING_THREADS"
     )]
     max_blocking_threads: u16,
-
-    /// Use mmap (file-backed) for storage. Any advantages are questionable and unproven.
-    /// If you use it, you know what you are doing.
-    #[arg(long)]
-    experimental_mmap_storage: bool,
 
     /// If set will use socks5 proxy for all outgoing connections.
     /// The format is socks5://[username:password]@host:port
@@ -512,7 +506,7 @@ fn main() -> anyhow::Result<()> {
         let token = token.clone();
         use signal_hook::{consts::SIGINT, consts::SIGTERM, iterator::Signals};
         let mut signals = Signals::new([SIGINT, SIGTERM])?;
-        thread::spawn(move || {
+        std::thread::spawn(move || {
             let mut cancel_triggered = false;
             while let Some(sig) = signals.forever().next() {
                 if cancel_triggered {
@@ -572,6 +566,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         }),
         log_file: opts.log_file.as_deref(),
         log_file_rust_log: Some(&opts.log_file_rust_log),
+        log_file_json: opts.log_file_json,
     })?;
 
     match librqbit::try_increase_nofile_limit() {
@@ -603,14 +598,26 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
         ..Default::default()
     });
 
+    let dht = if opts.disable_dht {
+        None
+    } else {
+        let persistence = if opts.disable_dht_persistence {
+            None
+        } else {
+            Some(DhtPersistenceConfig::default())
+        };
+        Some(DhtSessionConfig {
+            bootstrap_addrs: opts
+                .dht_bootstrap_addrs
+                .as_ref()
+                .map(|s| s.split(",").map(|v| v.to_string()).collect()),
+            port: None,
+            persistence,
+        })
+    };
+
     let mut sopts = SessionOptions {
-        disable_dht: opts.disable_dht,
-        disable_dht_persistence: opts.disable_dht_persistence,
-        dht_bootstrap_addrs: opts
-            .dht_bootstrap_addrs
-            .as_ref()
-            .map(|s| s.split(",").map(|v| v.to_string()).collect()),
-        dht_config: None,
+        dht,
         // This will be overridden by "server start" below if needed.
         persistence: None,
         peer_id: None,
@@ -638,11 +645,7 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
                 s
             }
 
-            if opts.experimental_mmap_storage {
-                wrap(MmapFilesystemStorageFactory::default()).boxed()
-            } else {
-                wrap(FilesystemStorageFactory::default()).boxed()
-            }
+            wrap(FilesystemStorageFactory::default()).boxed()
         }),
         concurrent_init_limit: Some(opts.concurrent_init_limit),
         root_span: None,
@@ -759,7 +762,9 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
 
             // "rqbit download" is ephemeral, so disable all persistence.
-            sopts.disable_dht_persistence = true;
+            if let Some(ref mut dht) = sopts.dht {
+                dht.persistence = None;
+            }
             sopts.persistence = None;
 
             let mut disable_http_api = download_opts.disable_http_api;
@@ -903,7 +908,9 @@ async fn async_main(mut opts: Opts, cancel: CancellationToken) -> anyhow::Result
             }
 
             // "rqbit share" is ephemeral, so disable all persistence.
-            sopts.disable_dht_persistence = true;
+            if let Some(ref mut dht) = sopts.dht {
+                dht.persistence = None;
+            }
             sopts.persistence = None;
 
             if sopts.listen.is_none() {
