@@ -1798,7 +1798,7 @@ impl tracker_comms::TorrentStatsProvider for PeerRxTorrentInfo {
             total_bytes: stats.total_bytes,
             uploaded_bytes: stats.uploaded_bytes,
             torrent_state: match stats.state {
-                TS::Initializing => S::Initializing,
+                TS::Initializing { .. } => S::Initializing,
                 TS::Live => S::Live,
                 TS::Paused => S::Paused,
                 TS::Error => S::None,
