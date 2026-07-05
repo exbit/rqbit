@@ -16,6 +16,9 @@ use crate::storage::{StorageFactory, TorrentStorage};
 
 use super::opened_file::OpenedFile;
 
+#[cfg(windows)]
+const WINDOWS_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
+
 #[derive(Default, Clone, Copy)]
 pub struct FilesystemStorageFactory {}
 
@@ -139,26 +142,19 @@ impl TorrentStorage for FilesystemStorage {
             };
             std::fs::create_dir_all(full_path.parent().context("bug: no parent")?)?;
             let f = if shared.options.allow_overwrite {
-                OpenOptions::new()
-                    .create(true)
-                    .truncate(false)
-                    .read(true)
-                    .write(true)
+                writable_open_options()
                     .open(&full_path)
                     .with_context(|| format!("error opening {full_path:?} in read/write mode"))?
             } else {
                 // create_new does not seem to work with read(true), so calling this twice.
-                OpenOptions::new()
-                    .create_new(true)
-                    .write(true)
-                    .open(&full_path)
+                create_new_open_options().open(&full_path)
                     .with_context(|| {
                         format!(
                             "error creating a new file (because allow_overwrite = false) {:?}",
                             &full_path
                         )
                     })?;
-                OpenOptions::new().read(true).write(true).open(&full_path)?
+                writable_open_options().open(&full_path)?
             };
             files.push(OpenedFile::new(full_path.clone(), f));
         }
@@ -166,4 +162,30 @@ impl TorrentStorage for FilesystemStorage {
         self.opened_files = files;
         Ok(())
     }
+}
+
+fn writable_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    apply_share_mode(&mut options);
+    options
+}
+
+fn create_new_open_options() -> OpenOptions {
+    let mut options = OpenOptions::new();
+    options.create_new(true).write(true);
+    apply_share_mode(&mut options);
+    options
+}
+
+fn apply_share_mode(options: &mut OpenOptions) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        options.share_mode(WINDOWS_SHARE_READ_WRITE_DELETE);
+    }
+
+    #[cfg(not(windows))]
+    let _ = options;
 }
