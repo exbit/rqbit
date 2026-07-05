@@ -68,6 +68,7 @@ impl TorrentStorage for FilesystemStorage {
 
     fn pwrite_all(&self, file_id: usize, offset: u64, buf: &[u8]) -> anyhow::Result<()> {
         let of = self.opened_files.get(file_id).context("no such file")?;
+        of.ensure_opened()?;
         #[cfg(windows)]
         return of.try_mark_sparse()?.pwrite_all(offset, buf);
         #[cfg(not(windows))]
@@ -81,6 +82,7 @@ impl TorrentStorage for FilesystemStorage {
         bufs: [IoSlice<'_>; 2],
     ) -> anyhow::Result<usize> {
         let of = self.opened_files.get(file_id).context("no such file")?;
+        of.ensure_opened()?;
         #[cfg(windows)]
         return of.try_mark_sparse()?.pwrite_all_vectored(offset, bufs);
         #[cfg(not(windows))]
@@ -93,6 +95,7 @@ impl TorrentStorage for FilesystemStorage {
 
     fn ensure_file_length(&self, file_id: usize, len: u64) -> anyhow::Result<()> {
         let f = &self.opened_files.get(file_id).context("no such file")?;
+        f.ensure_opened()?;
         #[cfg(windows)]
         f.try_mark_sparse()?;
         Ok(f.lock_read()?.set_len(len)?)
@@ -107,6 +110,13 @@ impl TorrentStorage for FilesystemStorage {
                 .collect::<anyhow::Result<Vec<_>>>()?,
             output_folder: self.output_folder.clone(),
         }))
+    }
+
+    fn on_file_completed(&self, file_id: usize) -> anyhow::Result<()> {
+        self.opened_files
+            .get(file_id)
+            .context("no such file")?
+            .reopen_read_only()
     }
 
     fn remove_directory_if_empty(&self, path: &Path) -> anyhow::Result<()> {
