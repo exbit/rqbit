@@ -219,7 +219,7 @@ impl TorrentStorage for FilesystemStorage {
                     .with_context(|| {
                         format!(
                             "error creating a new file (because allow_overwrite = false) {:?}",
-                            &full_path
+                            full_path
                         )
                     })?;
                 writable_open_options().open(&full_path)?
