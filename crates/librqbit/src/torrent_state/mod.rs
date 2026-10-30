@@ -358,6 +358,11 @@ impl ManagedTorrent {
                     let init = init.clone();
                     init.clear_pause_request();
                     if !init.try_start_check() {
+                        // The running check picks the latest `paused` once it's done.
+                        // A torrent added paused has no peer stream: hand it this one.
+                        if !start_paused {
+                            init.set_pending_peer_rx(peer_rx);
+                        }
                         return Ok(());
                     }
 
@@ -391,6 +396,10 @@ impl ManagedTorrent {
                                         return Ok(());
                                     }
 
+                                    // start()/pause() calls made during the check only
+                                    // updated `paused`: the latest one wins.
+                                    let start_paused = g.paused;
+                                    let peer_rx = peer_rx.or(init.take_pending_peer_rx());
                                     g.state = ManagedTorrentState::Paused(paused);
                                     if start_paused
                                         && let ManagedTorrentState::Paused(paused) = &g.state
@@ -509,6 +518,7 @@ impl ManagedTorrent {
                 let init = init.clone();
                 g.paused = true;
                 init.request_pause();
+                init.set_pending_peer_rx(None);
                 self.state_change_notify.notify_waiters();
                 Ok(())
             }

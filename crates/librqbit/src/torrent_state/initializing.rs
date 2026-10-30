@@ -18,7 +18,7 @@ use crate::{
     bitv_factory::BitVFactory,
     chunk_tracker::{ChunkTracker, compute_selected_pieces},
     file_ops::FileOps,
-    type_aliases::{BF, FileStorage},
+    type_aliases::{BF, FileStorage, PeerStream},
 };
 
 const MAX_FASTRESUME_CHECKS: usize = 64;
@@ -33,6 +33,8 @@ pub struct TorrentStateInitializing {
     pub(crate) checked_bytes: AtomicU64,
     pause_requested: AtomicBool,
     check_running: AtomicBool,
+    // Peer stream of a start request that came while the check was running.
+    pending_peer_rx: parking_lot::Mutex<Option<PeerStream>>,
     previously_errored: bool,
 }
 
@@ -52,6 +54,7 @@ impl TorrentStateInitializing {
             checked_bytes: AtomicU64::new(0),
             pause_requested: AtomicBool::new(false),
             check_running: AtomicBool::new(false),
+            pending_peer_rx: parking_lot::Mutex::new(None),
             previously_errored,
         }
     }
@@ -81,6 +84,16 @@ impl TorrentStateInitializing {
 
     pub(crate) fn finish_check(&self) {
         self.check_running.store(false, Ordering::Release);
+    }
+
+    /// Keeps the peer stream of a start request for the running check: the check
+    /// task starts the torrent with it once the check is done.
+    pub(crate) fn set_pending_peer_rx(&self, peer_rx: Option<PeerStream>) {
+        *self.pending_peer_rx.lock() = peer_rx;
+    }
+
+    pub(crate) fn take_pending_peer_rx(&self) -> Option<PeerStream> {
+        self.pending_peer_rx.lock().take()
     }
 
     async fn validate_fastresume(
