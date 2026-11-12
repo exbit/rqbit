@@ -21,6 +21,11 @@ pub enum Error {
         tcp: librqbit_dualstack_sockets::Error,
         utp: librqbit_utp::Error,
     },
+    #[error("error connecting: proxy={proxy:#} uTP={utp:#}")]
+    ProxyOrUtpConnect {
+        proxy: tokio_socks::Error,
+        utp: librqbit_utp::Error,
+    },
     #[error("uTP disabled")]
     UtpDisabled,
     #[error("TCP connections disabled")]

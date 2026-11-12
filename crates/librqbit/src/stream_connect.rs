@@ -34,7 +34,8 @@ impl std::fmt::Display for ConnectionKind {
 
 pub struct ConnectionOptions {
     // socks5://[username:password@]host:port
-    // If set, all outgoing connections will go through the proxy over TCP.
+    // If set, outgoing TCP connections go through the proxy. The proxy carries only TCP,
+    // so uTP (if a uTP listener is enabled) still connects directly, racing the proxy.
     pub proxy_url: Option<String>,
     // TCP outgoing connections are enabled by default
     pub enable_tcp: bool,
@@ -109,6 +110,30 @@ impl SocksProxyConfig {
         };
 
         Ok(tokio::io::split(stream))
+    }
+}
+
+/// A connected peer stream and how it was connected.
+type PeerStream = (ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite);
+
+/// Why the TCP side of a connection attempt failed: direct TCP or the SOCKS proxy in its place.
+#[derive(Debug)]
+enum TcpSideError {
+    Tcp(librqbit_dualstack_sockets::Error),
+    Proxy(tokio_socks::Error),
+}
+
+impl TcpSideError {
+    /// The error of an attempt where neither TCP (or the proxy) nor uTP connected.
+    fn combine(tcp: Option<Self>, utp: Option<librqbit_utp::Error>) -> Error {
+        match (tcp, utp) {
+            (Some(Self::Tcp(tcp)), Some(utp)) => Error::Connect { tcp, utp },
+            (Some(Self::Proxy(proxy)), Some(utp)) => Error::ProxyOrUtpConnect { proxy, utp },
+            (Some(Self::Tcp(tcp)), None) => Error::TcpConnect(tcp),
+            (Some(Self::Proxy(proxy)), None) => Error::SocksConnect(proxy),
+            (None, Some(utp)) => Error::UtpConnect(utp),
+            (None, None) => Error::ConnectDisabled,
+        }
     }
 }
 
@@ -205,14 +230,43 @@ impl StreamConnector {
         .await
     }
 
+    /// The TCP side of a connection attempt: through the SOCKS proxy if one is set,
+    /// directly otherwise. `None` means TCP is disabled.
+    async fn tcp_or_proxy_connect(
+        &self,
+        addr: SocketAddr,
+    ) -> std::result::Result<Option<PeerStream>, TcpSideError> {
+        if let Some(proxy) = self.proxy_config.as_ref() {
+            let (r, w) = self
+                .with_stat(ConnectionKind::Socks, addr.is_ipv6(), proxy.connect(addr))
+                .await
+                .map_err(TcpSideError::Proxy)?;
+            debug!(?addr, "connected through SOCKS5");
+            return Ok(Some((
+                ConnectionKind::Socks,
+                Box::new(r.into_vectored_compat()),
+                Box::new(w),
+            )));
+        }
+
+        if !self.enable_tcp {
+            return Ok(None);
+        }
+
+        let (r, w) = self
+            .tcp_connect(addr)
+            .await
+            .map_err(TcpSideError::Tcp)?
+            .into_split();
+        debug!(?addr, "connected over TCP");
+        Ok(Some((ConnectionKind::Tcp, Box::new(r), Box::new(w))))
+    }
+
     pub fn stats(&self) -> &ConnectStatsAtomic {
         &self.stats
     }
 
-    pub async fn connect(
-        &self,
-        addr: SocketAddr,
-    ) -> Result<(ConnectionKind, BoxAsyncReadVectored, BoxAsyncWrite)> {
+    pub async fn connect(&self, addr: SocketAddr) -> Result<PeerStream> {
         if addr.port() == 0 {
             return Err(Error::Anyhow(anyhow::anyhow!(
                 "invalid peer address (port 0): {}",
@@ -227,30 +281,13 @@ impl StreamConnector {
             )));
         }
 
-        if let Some(proxy) = self.proxy_config.as_ref() {
-            let (r, w) = self
-                .with_stat(ConnectionKind::Socks, addr.is_ipv6(), proxy.connect(addr))
-                .await?;
-            debug!(?addr, "connected through SOCKS5");
-            return Ok((
-                ConnectionKind::Socks,
-                Box::new(r.into_vectored_compat()),
-                Box::new(w),
-            ));
-        }
-
         // Try to connect over TCP first. If in 1 second we haven't connected, try uTP also (if configured).
-        // Whoever connects first wins.
-        let tcp_connect = async {
-            if !self.enable_tcp {
-                return Ok(None);
-            }
-            let conn = self.tcp_connect(addr).await?;
-            debug!(?addr, "connected over TCP");
-            Ok::<_, librqbit_dualstack_sockets::Error>(Some(conn))
-        };
+        // Whoever connects first wins. A SOCKS proxy, if set, takes the place of direct TCP:
+        // it only carries TCP, so uTP keeps going directly.
+        let tcp_connect = self.tcp_or_proxy_connect(addr);
 
         let tcp_failed_notify = tokio::sync::Notify::new();
+        let tcp_enabled = self.enable_tcp || self.proxy_config.is_some();
 
         let utp_connect = async {
             let sock = match self.utp_socket.as_ref() {
@@ -259,7 +296,7 @@ impl StreamConnector {
             };
 
             // Give TCP priority as it's more mature and simpler.
-            if self.enable_tcp {
+            if tcp_enabled {
                 // wait until either 1 second has passed or TCP failed.
                 tokio::select! {
                     _ = tcp_failed_notify.notified() => {},
@@ -278,26 +315,18 @@ impl StreamConnector {
         tokio::pin!(tcp_connect);
         tokio::pin!(utp_connect);
 
-        let mut tcp_err: Option<Option<librqbit_dualstack_sockets::Error>> = None;
+        let mut tcp_err: Option<Option<TcpSideError>> = None;
         let mut utp_err: Option<Option<librqbit_utp::Error>> = None;
 
         // wait until all fail, or one succeeds.
         loop {
             if let (Some(tcp), Some(utp)) = (tcp_err.as_mut(), utp_err.as_mut()) {
-                match (tcp.take(), utp.take()) {
-                    (Some(tcp), Some(utp)) => return Err(Error::Connect { tcp, utp }),
-                    (Some(tcp), None) => return Err(Error::TcpConnect(tcp)),
-                    (None, Some(utp)) => return Err(Error::UtpConnect(utp)),
-                    (None, None) => return Err(Error::ConnectDisabled),
-                }
+                return Err(TcpSideError::combine(tcp.take(), utp.take()));
             }
             tokio::select! {
                 tcp_res = &mut tcp_connect, if tcp_err.is_none() => {
                     match tcp_res {
-                        Ok(Some(stream)) => {
-                            let (r, w) = stream.into_split();
-                            return Ok((ConnectionKind::Tcp, Box::new(r), Box::new(w)));
-                        },
+                        Ok(Some(connection)) => return Ok(connection),
                         Ok(None) => {
                             tcp_err = Some(None);
                             tcp_failed_notify.notify_waiters();

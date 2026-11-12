@@ -1,16 +1,139 @@
 use std::{
     net::{Ipv6Addr, SocketAddr},
+    num::NonZeroUsize,
     sync::Arc,
 };
 
 use anyhow::Context;
-use librqbit_dualstack_sockets::{BindOpts, TcpListener};
-use librqbit_utp::{BindDevice, UtpSocketUdp, UtpSocketUdpOpts};
+use dontfrag::UdpSocketExt;
+use librqbit_dualstack_sockets::{BindOpts, TcpListener, UdpSocket};
+use librqbit_utp::{BindDevice, UtpSocketUdp};
 use tokio::io::AsyncWrite;
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::{stream_connect::ConnectionKind, vectored_traits::AsyncReadVectored};
+
+/// librqbit-utp defaults for the options below, used to size the receive buffer
+/// the same way `UtpSocketUdp::new_udp_with_opts` does.
+const UTP_DEFAULT_MAX_LIVE_VSOCKS: usize = 128;
+const UTP_DEFAULT_VSOCK_RX_BUFSIZE: usize = 1024 * 1024;
+
+/// The uTP socket, set up like `UtpSocketUdp::new_udp_with_opts` does.
+///
+/// The difference is Windows: there a UDP socket reports an ICMP "port unreachable"
+/// for an earlier datagram as WSAECONNRESET (10054) from the next `recv_from`, and an
+/// ICMP "TTL expired" as WSAENETRESET (10052). librqbit-utp stops its dispatcher on any
+/// receive error, so the first peer without an open UDP port killed uTP for the whole
+/// session within seconds of the start. Such reports carry nothing for a socket shared by
+/// all peers, so they are switched off.
+fn bind_utp_socket(
+    addr: SocketAddr,
+    opts: librqbit_utp::SocketOpts,
+    device: Option<&BindDevice>,
+) -> anyhow::Result<Arc<UtpSocketUdp>> {
+    let socket = UdpSocket::bind_udp(
+        addr,
+        BindOpts {
+            request_dualstack: true,
+            reuseport: false,
+            device,
+        },
+    )
+    .context("error binding UDP socket for uTP")?;
+
+    set_dont_fragment(socket.socket(), addr);
+    set_receive_buffer(socket.socket(), utp_receive_buffer_size(&opts));
+    #[cfg(windows)]
+    ignore_icmp_errors(socket.socket());
+
+    Ok(UtpSocketUdp::new_with_opts(
+        socket,
+        Default::default(),
+        opts,
+    )?)
+}
+
+fn set_dont_fragment(socket: &tokio::net::UdpSocket, addr: SocketAddr) {
+    if addr.is_ipv4() {
+        if let Err(e) = socket.set_dontfrag_v4(true) {
+            warn!("error setting IPV4_DONTFRAG: {e:#}");
+        }
+    } else if let Err(e) = socket.set_dontfrag_v6(true) {
+        debug!("error setting IPV6_DONTFRAG: {e:#}");
+    }
+}
+
+/// Large enough to fit the RX windows of all streams in case the socket isn't drained fast enough.
+fn utp_receive_buffer_size(opts: &librqbit_utp::SocketOpts) -> usize {
+    let streams = opts
+        .max_live_vsocks
+        .map_or(UTP_DEFAULT_MAX_LIVE_VSOCKS, NonZeroUsize::get);
+    let per_stream = opts
+        .vsock_rx_bufsize_bytes
+        .map_or(UTP_DEFAULT_VSOCK_RX_BUFSIZE, NonZeroUsize::get);
+
+    // Some heuristic overhead for uTP and ACK packets.
+    streams * per_stream * 10 / 8
+}
+
+fn set_receive_buffer(socket: &tokio::net::UdpSocket, size: usize) {
+    let socket = socket2::SockRef::from(socket);
+
+    match socket.set_recv_buffer_size(size) {
+        Ok(()) => debug!(
+            requested = size,
+            current = ?socket.recv_buffer_size().ok(),
+            "set UDP receive buffer size for uTP"
+        ),
+        Err(e) => warn!(
+            requested = size,
+            "error setting UDP receive buffer size: {e:#}"
+        ),
+    }
+}
+
+#[cfg(windows)]
+fn ignore_icmp_errors(socket: &tokio::net::UdpSocket) {
+    use std::os::windows::io::AsRawSocket;
+    use windows::Win32::Networking::WinSock::{
+        SIO_UDP_CONNRESET, SIO_UDP_NETRESET, SOCKET, WSAGetLastError, WSAIoctl,
+    };
+
+    let raw = SOCKET(socket.as_raw_socket() as usize);
+    let disabled: u32 = 0;
+
+    for (code, name) in [
+        (SIO_UDP_CONNRESET, "SIO_UDP_CONNRESET"),
+        (SIO_UDP_NETRESET, "SIO_UDP_NETRESET"),
+    ] {
+        let mut returned = 0u32;
+        // SAFETY: `raw` is a live socket owned by `socket`; the input buffer is a 4-byte BOOL
+        // that outlives the synchronous call, no output buffer and no overlapped I/O.
+        let result = unsafe {
+            WSAIoctl(
+                raw,
+                code,
+                Some(std::ptr::from_ref(&disabled).cast()),
+                size_of::<u32>() as u32,
+                None,
+                0,
+                &mut returned,
+                None,
+                None,
+            )
+        };
+
+        if result != 0 {
+            let error = unsafe { WSAGetLastError() };
+            warn!(
+                ioctl = name,
+                error = error.0,
+                "error disabling UDP ICMP error reports"
+            );
+        }
+    }
+}
 
 pub(crate) struct ListenResult {
     pub tcp_socket: Option<TcpListener>,
@@ -118,12 +241,7 @@ impl ListenerOptions {
         };
 
         let utp_socket = if self.mode.utp_enabled() {
-            let bind_result = UtpSocketUdp::new_udp_with_opts(
-                listen_addr,
-                utp_opts,
-                UtpSocketUdpOpts { bind_device },
-            )
-            .await;
+            let bind_result = bind_utp_socket(listen_addr, utp_opts, bind_device);
             match bind_result {
                 Ok(sock) => {
                     listen_addr = sock.bind_addr();

@@ -105,6 +105,7 @@ arc-swap.workspace = true
 intervaltree.workspace = true
 async-compression = { workspace = true, features = ["tokio", "gzip"] }
 librqbit-utp = { workspace = true, features = ["export-metrics"] }
+dontfrag.workspace = true
 axum-extra = { workspace = true, features = ["query"] }
 librqbit-dualstack-sockets = { workspace = true, features = ["axum"] }
 socket2.workspace = true
@@ -112,7 +113,7 @@ nix = { workspace = true, features = ["uio"] }
 thiserror.workspace = true
 
 [target.'cfg(windows)'.dependencies]
-windows = { workspace = true, features = ["Win32", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
+windows = { workspace = true, features = ["Win32", "Win32_Networking_WinSock", "Win32_System", "Win32_System_IO", "Win32_System_Ioctl"] }
 
 [build-dependencies]
 anyhow.workspace = true
