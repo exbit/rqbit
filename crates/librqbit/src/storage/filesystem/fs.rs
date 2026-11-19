@@ -20,16 +20,35 @@ use super::opened_file::OpenedFile;
 #[cfg(windows)]
 const WINDOWS_SHARE_READ_WRITE_DELETE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
 
-fn overlap_spill_root(shared: &ManagedTorrentShared) -> PathBuf {
-    std::env::temp_dir().join("rqbit-overlap").join(format!(
-        "{}-{}",
-        shared.info_hash.as_string(),
-        shared.id
-    ))
+/// Where the parts of unselected files that share pieces with selected ones are kept by
+/// default: the system temp folder, which the system may clean up at any time.
+fn default_overlap_folder() -> PathBuf {
+    std::env::temp_dir().join("rqbit-overlap")
 }
 
-#[derive(Default, Clone, Copy)]
-pub struct FilesystemStorageFactory {}
+#[derive(Default, Clone)]
+pub struct FilesystemStorageFactory {
+    /// Folder for the parts of unselected files that share pieces with selected ones,
+    /// one subfolder per torrent; `None` keeps them in the system temp folder.
+    overlap_folder: Option<PathBuf>,
+}
+
+impl FilesystemStorageFactory {
+    /// Keeps the parts of unselected files that share pieces with selected ones in
+    /// `folder` instead of the system temp folder.
+    pub fn with_overlap_folder(folder: PathBuf) -> Self {
+        Self {
+            overlap_folder: Some(folder),
+        }
+    }
+
+    fn overlap_spill_root(&self, shared: &ManagedTorrentShared) -> PathBuf {
+        self.overlap_folder
+            .clone()
+            .unwrap_or_else(default_overlap_folder)
+            .join(format!("{}-{}", shared.info_hash.as_string(), shared.id))
+    }
+}
 
 impl StorageFactory for FilesystemStorageFactory {
     type Storage = FilesystemStorage;
@@ -41,13 +60,13 @@ impl StorageFactory for FilesystemStorageFactory {
     ) -> anyhow::Result<FilesystemStorage> {
         Ok(FilesystemStorage {
             output_folder: shared.options.output_folder.clone(),
-            overlap_spill_root: overlap_spill_root(shared),
+            overlap_spill_root: self.overlap_spill_root(shared),
             opened_files: Default::default(),
         })
     }
 
     fn clone_box(&self) -> crate::storage::BoxStorageFactory {
-        self.boxed()
+        self.clone().boxed()
     }
 }
 

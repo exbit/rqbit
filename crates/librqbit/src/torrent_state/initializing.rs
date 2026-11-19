@@ -8,6 +8,7 @@ use std::{
 
 use anyhow::Context;
 
+use bitvec::{order::Msb0, slice::BitSlice};
 use rand::{RngExt, seq::IteratorRandom};
 use size_format::SizeFormatterBinary as SF;
 use tracing::{info, trace, warn};
@@ -24,6 +25,17 @@ use crate::{
 const MAX_FASTRESUME_CHECKS: usize = 64;
 
 use super::{ManagedTorrentShared, TorrentMetadata, paused::TorrentStatePaused};
+
+/// Outcome of validating the fastresume bitfield against the files on disk.
+enum FastresumeCheck {
+    /// Every sampled piece could be read.
+    Valid,
+    /// Some files are missing or truncated on disk: only their pieces were dropped from
+    /// the bitfield, and the selected ones will be downloaded again.
+    FilesDropped { files: usize, pieces: usize },
+    /// A read failed for another reason: the bitfield is not trusted at all.
+    Broken,
+}
 
 pub struct TorrentStateInitializing {
     pub(crate) files: FileStorage,
@@ -101,7 +113,7 @@ impl TorrentStateInitializing {
         bitv_factory: &dyn BitVFactory,
         have_pieces: Option<Box<dyn BitV>>,
     ) -> Option<Box<dyn BitV>> {
-        let hp = have_pieces?;
+        let mut hp = have_pieces?;
         let actual = hp.as_bytes().len();
         let expected = self.metadata.lengths().piece_bitfield_bytes();
         if actual != expected {
@@ -113,7 +125,7 @@ impl TorrentStateInitializing {
             return None;
         }
 
-        let is_broken = self
+        let outcome = self
             .shared
             .spawner
             .block_in_place_with_semaphore(|| {
@@ -122,81 +134,150 @@ impl TorrentStateInitializing {
                     &self.files,
                     &self.metadata.file_infos,
                 );
-
-                let mut to_validate = BF::from_boxed_slice(
-                    vec![0u8; self.metadata.lengths().piece_bitfield_bytes()].into_boxed_slice(),
-                );
-                let mut queue = hp.as_slice().to_owned();
-
-                // Validate at least one piece from each file, if we claim we have it.
-                for fi in self.metadata.file_infos.iter() {
-                    let prange = fi.piece_range_usize();
-                    let offset = prange.start;
-                    for piece_id in hp
-                        .as_slice()
-                        .get(fi.piece_range_usize())
-                        .into_iter()
-                        .flat_map(|s| s.iter_ones())
-                        .map(|pid| pid + offset)
-                        .take(1)
-                    {
-                        to_validate.set(piece_id, true);
-                        queue.set(piece_id, false);
-                    }
-                }
-
-                // For all the remaining pieces we claim we have, validate them with decreasing probability.
-                let queue = queue
-                    .iter_ones()
-                    .sample(&mut rand::rng(), MAX_FASTRESUME_CHECKS);
-
-                for (tmp_id, piece_id) in queue.into_iter().enumerate() {
-                    let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
-                    if rand::rng().random_ratio(1, denom) {
-                        to_validate.set(piece_id, true);
-                    }
-                }
-
-                let to_validate_count = to_validate.count_ones();
-                for (id, piece_id) in to_validate
-                    .iter_ones()
-                    .filter_map(|id| {
-                        self.metadata
-                            .lengths()
-                            .validate_piece_index(id.try_into().ok()?)
-                    })
-                    .enumerate()
-                {
-                    if fo.check_piece(piece_id).is_err() {
-                        return true;
-                    }
-
-                    #[allow(clippy::cast_possible_truncation)]
-                    let progress = (self.metadata.lengths().total_length() as f64
-                        / to_validate_count as f64
-                        * (id + 1) as f64) as u64;
-                    let progress = progress.min(self.metadata.lengths().total_length());
-                    self.checked_bytes.store(progress, Ordering::Relaxed);
-                }
-
-                false
+                let to_validate = self.pieces_to_validate(hp.as_slice());
+                self.check_claimed_pieces(&fo, hp.as_slice_mut(), &to_validate)
             })
             .await;
 
-        if is_broken {
-            warn!(
-                id = ?self.shared.id,
-                info_hash = ?self.shared.info_hash,
-                "data corrupted, ignoring fastresume data"
-            );
-            if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
-                warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
+        match outcome {
+            FastresumeCheck::Valid => Some(hp),
+            FastresumeCheck::FilesDropped { files, pieces } => {
+                warn!(
+                    id = ?self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    files,
+                    pieces,
+                    "files missing or truncated on disk, dropped only their pieces"
+                );
+                if let Err(e) = hp.flush(false) {
+                    warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error flushing bitfield: {e:#}");
+                }
+                Some(hp)
             }
-            self.checked_bytes.store(0, Ordering::Relaxed);
-            return None;
+            FastresumeCheck::Broken => {
+                warn!(
+                    id = ?self.shared.id,
+                    info_hash = ?self.shared.info_hash,
+                    "data corrupted, ignoring fastresume data"
+                );
+                if let Err(e) = bitv_factory.clear(self.shared.id.into()).await {
+                    warn!(id=?self.shared.id, info_hash = ?self.shared.info_hash, "error clearing bitfield: {e:#}");
+                }
+                self.checked_bytes.store(0, Ordering::Relaxed);
+                None
+            }
+        }
+    }
+
+    /// Pieces to validate: at least one claimed piece of each file, plus claimed pieces
+    /// sampled with decreasing probability.
+    fn pieces_to_validate(&self, have: &BitSlice<u8, Msb0>) -> BF {
+        let mut to_validate = BF::from_boxed_slice(
+            vec![0u8; self.metadata.lengths().piece_bitfield_bytes()].into_boxed_slice(),
+        );
+        let mut queue = have.to_owned();
+
+        // Validate at least one piece from each file, if we claim we have it.
+        for fi in self.metadata.file_infos.iter() {
+            let prange = fi.piece_range_usize();
+            let offset = prange.start;
+            for piece_id in have
+                .get(fi.piece_range_usize())
+                .into_iter()
+                .flat_map(|s| s.iter_ones())
+                .map(|pid| pid + offset)
+                .take(1)
+            {
+                to_validate.set(piece_id, true);
+                queue.set(piece_id, false);
+            }
         }
 
-        Some(hp)
+        // For all the remaining pieces we claim we have, validate them with decreasing probability.
+        let queue = queue
+            .iter_ones()
+            .sample(&mut rand::rng(), MAX_FASTRESUME_CHECKS);
+
+        for (tmp_id, piece_id) in queue.into_iter().enumerate() {
+            let denom: u32 = (tmp_id + 1).min(50).try_into().unwrap();
+            if rand::rng().random_ratio(1, denom) {
+                to_validate.set(piece_id, true);
+            }
+        }
+
+        to_validate
+    }
+
+    /// Reads the sampled pieces. A read error caused by a file that is missing or
+    /// truncated on disk (e.g. a game client deleted it) drops only that file's pieces
+    /// from `have`: the selected ones are downloaded again instead of re-checking the
+    /// whole torrent. A hash mismatch is ignored, as before.
+    fn check_claimed_pieces(
+        &self,
+        fo: &FileOps<'_>,
+        have: &mut BitSlice<u8, Msb0>,
+        to_validate: &BF,
+    ) -> FastresumeCheck {
+        let lengths = self.metadata.lengths();
+        let to_validate_count = to_validate.count_ones();
+        let (mut files, mut pieces) = (0, 0);
+
+        for (id, piece_id) in to_validate
+            .iter_ones()
+            .filter_map(|id| lengths.validate_piece_index(id.try_into().ok()?))
+            .enumerate()
+        {
+            let index = piece_id.get() as usize;
+
+            // Pieces of an already dropped file are no longer claimed.
+            if have[index] && fo.check_piece(piece_id).is_err() {
+                let Some((dropped_files, dropped_pieces)) =
+                    self.drop_missing_files(fo, have, index)
+                else {
+                    return FastresumeCheck::Broken;
+                };
+                files += dropped_files;
+                pieces += dropped_pieces;
+            }
+
+            #[allow(clippy::cast_possible_truncation)]
+            let progress = (lengths.total_length() as f64 / to_validate_count as f64
+                * (id + 1) as f64) as u64;
+            let progress = progress.min(lengths.total_length());
+            self.checked_bytes.store(progress, Ordering::Relaxed);
+        }
+
+        if files == 0 {
+            FastresumeCheck::Valid
+        } else {
+            FastresumeCheck::FilesDropped { files, pieces }
+        }
+    }
+
+    /// Drops the claimed pieces of the missing or truncated files that `piece` touches.
+    /// Returns the number of dropped files and pieces; `None` if all of them are in
+    /// place, so the read failed for another reason.
+    fn drop_missing_files(
+        &self,
+        fo: &FileOps<'_>,
+        have: &mut BitSlice<u8, Msb0>,
+        piece: usize,
+    ) -> Option<(usize, usize)> {
+        let (mut files, mut pieces) = (0, 0);
+
+        for (file_id, fi) in self.metadata.file_infos.iter().enumerate() {
+            let range = fi.piece_range_usize();
+
+            if !range.contains(&piece) || !fo.is_file_missing_or_truncated(file_id) {
+                continue;
+            }
+
+            pieces += have[range.clone()].count_ones();
+            have[range].fill(false);
+            files += 1;
+        }
+
+        (files > 0).then_some((files, pieces))
     }
 
     pub async fn check(&self) -> anyhow::Result<TorrentStatePaused> {

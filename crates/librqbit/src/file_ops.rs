@@ -183,6 +183,32 @@ impl<'a> FileOps<'a> {
         Ok(have_pieces)
     }
 
+    /// Whether the file is missing on disk or shorter than the torrent says: deleted by
+    /// another application (a selected file is recreated empty when the storage opens
+    /// it, an unselected one is opened lazily and stays missing) or truncated. Other read
+    /// errors (e.g. the file is locked) are not reported here.
+    pub fn is_file_missing_or_truncated(&self, file_id: usize) -> bool {
+        let Some(fi) = self.file_infos.get(file_id) else {
+            return false;
+        };
+
+        if fi.len == 0 || fi.attrs.padding {
+            return false;
+        }
+
+        match self.files.pread_exact(file_id, fi.len - 1, &mut [0u8; 1]) {
+            Ok(()) => false,
+            Err(error) => error.chain().any(|cause| {
+                cause.downcast_ref::<std::io::Error>().is_some_and(|io| {
+                    matches!(
+                        io.kind(),
+                        std::io::ErrorKind::UnexpectedEof | std::io::ErrorKind::NotFound
+                    )
+                })
+            }),
+        }
+    }
+
     pub fn check_piece(&self, piece_index: ValidPieceIndex) -> anyhow::Result<bool> {
         if cfg!(feature = "_disable_disk_write_net_benchmark") {
             return Ok(true);
