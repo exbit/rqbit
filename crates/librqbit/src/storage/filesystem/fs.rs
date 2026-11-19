@@ -35,7 +35,9 @@ pub struct FilesystemStorageFactory {
 
 impl FilesystemStorageFactory {
     /// Keeps the parts of unselected files that share pieces with selected ones in
-    /// `folder` instead of the system temp folder.
+    /// `folder` instead of the system temp folder, one subfolder per info hash. A session
+    /// holds a torrent once, so the folder must belong to one session; the parts survive
+    /// re-adding the torrent, which gives it a new id.
     pub fn with_overlap_folder(folder: PathBuf) -> Self {
         Self {
             overlap_folder: Some(folder),
@@ -43,10 +45,12 @@ impl FilesystemStorageFactory {
     }
 
     fn overlap_spill_root(&self, shared: &ManagedTorrentShared) -> PathBuf {
-        self.overlap_folder
-            .clone()
-            .unwrap_or_else(default_overlap_folder)
-            .join(format!("{}-{}", shared.info_hash.as_string(), shared.id))
+        match &self.overlap_folder {
+            Some(folder) => folder.join(shared.info_hash.as_string()),
+            // The temp folder is shared by every session: the id keeps them apart.
+            None => default_overlap_folder()
+                .join(format!("{}-{}", shared.info_hash.as_string(), shared.id)),
+        }
     }
 }
 
