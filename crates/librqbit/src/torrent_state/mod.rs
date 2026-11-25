@@ -118,6 +118,8 @@ pub(crate) struct ManagedTorrentOptions {
     pub ratelimits: LimitsConfig,
     pub initial_peers: Vec<SocketAddr>,
     pub peer_limit: Option<usize>,
+    /// Shared with the other torrents (`SessionOptions::global_peer_limit`).
+    pub global_peer_limit: Option<Arc<tokio::sync::Semaphore>>,
     #[cfg(feature = "disable-upload")]
     pub _disable_upload: bool,
 }

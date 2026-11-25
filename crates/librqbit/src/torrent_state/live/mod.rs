@@ -178,6 +178,13 @@ pub enum AddIncomingPeerResult {
     ConcurrencyLimitReached,
 }
 
+/// A peer's place within the torrent's limit and, if set, the global one.
+/// Both are released when the peer task ends.
+struct PeerPermit {
+    _torrent: OwnedSemaphorePermit,
+    _global: Option<OwnedSemaphorePermit>,
+}
+
 pub struct TorrentStateLive {
     peers: PeerStates,
     pub(crate) shared: Arc<ManagedTorrentShared>,
@@ -193,6 +200,9 @@ pub struct TorrentStateLive {
 
     // Limits how many active (occupying network resources) peers there are at a moment in time.
     peer_semaphore: Arc<Semaphore>,
+
+    // The same limit for all torrents together (`SessionOptions::global_peer_limit`).
+    global_peer_semaphore: Option<Arc<Semaphore>>,
 
     // The queue for peer manager to connect to them.
     peer_queue_tx: UnboundedSender<SocketAddr>,
@@ -289,6 +299,7 @@ impl TorrentStateLive {
             peer_semaphore: Arc::new(Semaphore::new(
                 paused.shared.options.peer_limit.unwrap_or(128),
             )),
+            global_peer_semaphore: paused.shared.options.global_peer_limit.clone(),
             new_pieces_notify: Notify::new(),
             peer_queue_tx,
             finished_notify: Notify::new(),
@@ -367,15 +378,41 @@ impl TorrentStateLive {
         &self.up_speed_estimator
     }
 
+    /// A place for an incoming peer, if both limits have room right now.
+    fn try_acquire_peer_permit(&self) -> Option<PeerPermit> {
+        let torrent = self.peer_semaphore.clone().try_acquire_owned().ok()?;
+        let global = match &self.global_peer_semaphore {
+            Some(global) => Some(global.clone().try_acquire_owned().ok()?),
+            None => None,
+        };
+        Some(PeerPermit {
+            _torrent: torrent,
+            _global: global,
+        })
+    }
+
+    /// A place for an outgoing peer: waits for the torrent's limit, then the global one.
+    async fn acquire_peer_permit(&self) -> crate::Result<PeerPermit> {
+        let torrent = self.peer_semaphore.clone().acquire_owned().await?;
+        let global = match &self.global_peer_semaphore {
+            Some(global) => Some(global.clone().acquire_owned().await?),
+            None => None,
+        };
+        Ok(PeerPermit {
+            _torrent: torrent,
+            _global: global,
+        })
+    }
+
     pub(crate) fn add_incoming_peer(
         self: &Arc<Self>,
         checked_peer: CheckedIncomingConnection,
     ) -> anyhow::Result<AddIncomingPeerResult> {
         use dashmap::mapref::entry::Entry;
         let (tx, rx) = unbounded_channel();
-        let permit = match self.peer_semaphore.clone().try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(_) => {
+        let permit = match self.try_acquire_peer_permit() {
+            Some(permit) => permit,
+            None => {
                 debug!("limit of live peers reached, dropping incoming peer");
                 self.peers.with_peer(checked_peer.addr, |p| {
                     atomic_inc(&p.stats.counters.incoming_connections);
@@ -477,7 +514,7 @@ impl TorrentStateLive {
         counters: Arc<AtomicPeerCounters>,
         tx: PeerTx,
         rx: PeerRx,
-        permit: OwnedSemaphorePermit,
+        permit: PeerPermit,
     ) -> crate::Result<()> {
         let handler = PeerHandler {
             addr: checked_peer.addr,
@@ -534,7 +571,7 @@ impl TorrentStateLive {
     async fn task_manage_outgoing_peer(
         self: Arc<Self>,
         addr: SocketAddr,
-        permit: OwnedSemaphorePermit,
+        permit: PeerPermit,
     ) -> crate::Result<()> {
         let state = self;
         let (rx, tx) = state.peers.mark_peer_connecting(addr)?;
@@ -658,7 +695,7 @@ impl TorrentStateLive {
                 continue;
             }
 
-            let permit = state.peer_semaphore.clone().acquire_owned().await?;
+            let permit = state.acquire_peer_permit().await?;
             state.spawn(
                 debug_span!(parent: state.shared.span.clone(), "manage_peer", peer = ?addr),
                 format!("[{}][addr={addr}]manage_peer", state.shared.id),

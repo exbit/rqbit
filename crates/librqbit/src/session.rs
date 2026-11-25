@@ -136,6 +136,7 @@ pub struct Session {
 
     // Limits and throttling
     pub(crate) concurrent_initialize_semaphore: Arc<tokio::sync::Semaphore>,
+    global_peer_limit: Option<Arc<tokio::sync::Semaphore>>,
     pub ratelimits: Limits,
 
     pub blocklist: IpRanges,
@@ -474,6 +475,11 @@ pub struct SessionOptions {
     /// Default peer limit per torrent.
     pub peer_limit: Option<usize>,
 
+    /// Limit on connected peers of all torrents together, on top of the per-torrent
+    /// `peer_limit`. Pass the same semaphore to several sessions to share the limit
+    /// between them.
+    pub global_peer_limit: Option<Arc<tokio::sync::Semaphore>>,
+
     #[cfg(feature = "disable-upload")]
     pub disable_upload: bool,
 
@@ -509,6 +515,7 @@ impl Default for SessionOptions {
             allowlist_url: None,
             trackers: HashSet::new(),
             peer_limit: None,
+            global_peer_limit: None,
             #[cfg(feature = "disable-upload")]
             disable_upload: false,
             disable_local_service_discovery: false,
@@ -806,6 +813,7 @@ impl Session {
                 concurrent_initialize_semaphore: Arc::new(tokio::sync::Semaphore::new(
                     opts.concurrent_init_limit.unwrap_or(3),
                 )),
+                global_peer_limit: opts.global_peer_limit,
                 udp_tracker_client,
                 ratelimits: Limits::new(opts.ratelimits),
                 ipv4_only: opts.ipv4_only,
@@ -1375,6 +1383,7 @@ impl Session {
                     ratelimits: opts.ratelimits,
                     initial_peers: opts.initial_peers.clone().unwrap_or_default(),
                     peer_limit: opts.peer_limit.or(self.peer_limit),
+                    global_peer_limit: self.global_peer_limit.clone(),
                     #[cfg(feature = "disable-upload")]
                     _disable_upload: self._disable_upload,
                 },
