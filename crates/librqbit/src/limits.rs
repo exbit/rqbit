@@ -5,6 +5,28 @@ use serde::Deserialize;
 use serde::Serialize;
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use std::time::Duration;
+
+use tokio::sync::{AcquireError, OwnedSemaphorePermit, Semaphore, TryAcquireError};
+
+/// How often a task waiting for a place within the global peer limit checks it again.
+const GLOBAL_PEER_RETRY: Duration = Duration::from_millis(200);
+
+/// Takes a place within the global peer limit (`SessionOptions::global_peer_limit`) without
+/// queueing for it. A queued `acquire` would receive every released permit before incoming
+/// peers, which only `try_acquire`: under load they would never get one.
+pub(crate) async fn acquire_global_peer(
+    limit: &Arc<Semaphore>,
+) -> Result<OwnedSemaphorePermit, AcquireError> {
+    loop {
+        match limit.clone().try_acquire_owned() {
+            Ok(permit) => return Ok(permit),
+            // A closed semaphore fails `acquire` right away with the error to return.
+            Err(TryAcquireError::Closed) => return limit.clone().acquire_owned().await,
+            Err(TryAcquireError::NoPermits) => tokio::time::sleep(GLOBAL_PEER_RETRY).await,
+        }
+    }
+}
 
 #[derive(Default, Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LimitsConfig {

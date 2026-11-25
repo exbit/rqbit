@@ -1679,6 +1679,7 @@ impl Session {
             Some(self.merge_peer_opts(peer_opts)),
             self.connector.clone(),
             self.client_name_and_version.clone(),
+            self.global_peer_limit.clone(),
         )
         .await
         {

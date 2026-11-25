@@ -27,6 +27,7 @@ pub enum ReadMetainfoResult<Rx> {
     },
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unpin>(
     peer_id: Id20,
     info_hash: Id20,
@@ -35,6 +36,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
     peer_connection_options: Option<PeerConnectionOptions>,
     connector: Arc<StreamConnector>,
     client_name_and_version: String,
+    global_peer_limit: Option<Arc<tokio::sync::Semaphore>>,
 ) -> ReadMetainfoResult<A> {
     let mut seen = HashSet::<SocketAddr>::new();
     let mut addrs = addrs_stream;
@@ -43,10 +45,16 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
 
     let read_info_guarded = |addr| {
         let semaphore = &semaphore;
+        let global_peer_limit = global_peer_limit.clone();
         let connector = connector.clone();
         let client_name_and_version = client_name_and_version.clone();
         async move {
             let token = semaphore.acquire().await?;
+            // These connections count towards the global peer limit too.
+            let global_token = match &global_peer_limit {
+                Some(limit) => Some(crate::limits::acquire_global_peer(limit).await?),
+                None => None,
+            };
             let ret = peer_info_reader::read_metainfo_from_peer(
                 addr,
                 peer_id,
@@ -61,6 +69,7 @@ pub async fn read_metainfo_from_peer_receiver<A: Stream<Item = SocketAddr> + Unp
             .instrument(debug_span!("read_metainfo_from_peer", ?addr))
             .await
             .with_context(|| format!("error reading metainfo from {addr}"));
+            drop(global_token);
             drop(token);
             ret
         }
@@ -146,6 +155,7 @@ mod tests {
             None,
             Arc::new(StreamConnector::new(Default::default()).await.unwrap()),
             crate::client_name_and_version().to_owned(),
+            None,
         )
         .await
         {

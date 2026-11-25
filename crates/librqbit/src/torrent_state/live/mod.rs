@@ -391,11 +391,12 @@ impl TorrentStateLive {
         })
     }
 
-    /// A place for an outgoing peer: waits for the torrent's limit, then the global one.
+    /// A place for an outgoing peer: waits for the torrent's limit, then the global one (without
+    /// queueing for it, see `acquire_global_peer`).
     async fn acquire_peer_permit(&self) -> crate::Result<PeerPermit> {
         let torrent = self.peer_semaphore.clone().acquire_owned().await?;
         let global = match &self.global_peer_semaphore {
-            Some(global) => Some(global.clone().acquire_owned().await?),
+            Some(global) => Some(crate::limits::acquire_global_peer(global).await?),
             None => None,
         };
         Ok(PeerPermit {
